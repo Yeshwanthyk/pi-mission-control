@@ -2,6 +2,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MissionContext } from "./types.ts";
 
+export interface PromptMissionBinding {
+  readonly missionId: string;
+  readonly itemId: string;
+  readonly sessionId: string;
+}
+
 const CONTEXT_PATTERN =
   /<pi-execution-context\s+token="([A-Za-z0-9._-]+)"\s*\/?>(?:<\/pi-execution-context>)?/;
 const POLICY_MARKER = "<!-- pi-mission-control-policy/v1 -->";
@@ -29,6 +35,7 @@ export function hasMissionPolicy(systemPrompt: string): boolean {
 export function childPromptPrefix(
   context: MissionContext,
   storeRoot: string,
+  binding?: PromptMissionBinding,
 ): string {
   const cliPath = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -44,6 +51,18 @@ export function childPromptPrefix(
     shellQuote(storeRoot),
     "--context",
     context.token,
+    ...(binding
+      ? [
+          "--mission",
+          shellQuote(binding.missionId),
+          "--item",
+          shellQuote(binding.itemId),
+          "--session",
+          shellQuote(binding.sessionId),
+          "--idempotency-key",
+          shellQuote("<KEY>"),
+        ]
+      : []),
   ].join(" ");
   return `${contextMarker(context.token)}
 You are contributing to mission "${context.title}". Before reporting a semantic milestone as complete, record it with mission_record when available. Otherwise run:

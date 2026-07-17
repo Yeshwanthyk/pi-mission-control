@@ -1,7 +1,9 @@
 import type {
   CreateMissionContextInput,
+  EvidenceArtifact,
   EvidenceArtifactInput,
   EvidenceMilestone,
+  EvidenceReceipt,
   EvidenceProducer,
   EvidenceState,
   JsonValue,
@@ -173,6 +175,70 @@ function parseArtifact(value: unknown, index: number): EvidenceArtifactInput {
   };
 }
 
+export function parseEvidenceReceipt(value: unknown): EvidenceReceipt {
+  const receipt = object(value, "receipt");
+  if (receipt.schema !== "pi.evidence/v1")
+    throw new Error("receipt has an unsupported schema");
+  if (!Array.isArray(receipt.artifacts))
+    throw new Error("receipt.artifacts must be an array");
+  const artifacts: EvidenceArtifact[] = receipt.artifacts.map(
+    (value, index) => {
+      const artifact = object(value, `receipt.artifacts[${index}]`);
+      const size = nonNegativeInteger(
+        artifact.size,
+        `receipt.artifacts[${index}].size`,
+      );
+      const sha256 = string(
+        artifact.sha256,
+        `receipt.artifacts[${index}].sha256`,
+      )!;
+      if (!/^[a-f0-9]{64}$/.test(sha256))
+        throw new Error(`receipt.artifacts[${index}].sha256 is invalid`);
+      return {
+        artifactId: string(
+          artifact.artifactId,
+          `receipt.artifacts[${index}].artifactId`,
+        )!,
+        role: string(artifact.role, `receipt.artifacts[${index}].role`)!,
+        ...defined(
+          "label",
+          string(artifact.label, `receipt.artifacts[${index}].label`, {
+            optional: true,
+          }),
+        ),
+        path: string(artifact.path, `receipt.artifacts[${index}].path`)!,
+        ...defined(
+          "sourcePath",
+          string(
+            artifact.sourcePath,
+            `receipt.artifacts[${index}].sourcePath`,
+            { optional: true },
+          ),
+        ),
+        mediaType: string(
+          artifact.mediaType,
+          `receipt.artifacts[${index}].mediaType`,
+        )!,
+        size,
+        sha256,
+      };
+    },
+  );
+  const recordedAt = string(receipt.recordedAt, "receipt.recordedAt")!;
+  if (Number.isNaN(Date.parse(recordedAt)))
+    throw new Error("receipt.recordedAt must be an ISO timestamp");
+  return {
+    schema: "pi.evidence/v1",
+    eventId: string(receipt.eventId, "receipt.eventId")!,
+    contextToken: string(receipt.contextToken, "receipt.contextToken")!,
+    producer: parseProducer(receipt.producer),
+    milestone: parseMilestone(receipt.milestone),
+    artifacts,
+    payload: asJsonValue(receipt.payload),
+    recordedAt,
+  };
+}
+
 export function parseRecordEvidenceInput(value: unknown): RecordEvidenceInput {
   const input = object(value, "evidence");
   const artifactsValue = input.artifacts;
@@ -188,6 +254,12 @@ export function parseRecordEvidenceInput(value: unknown): RecordEvidenceInput {
     artifacts: (artifactsValue ?? []).map(parseArtifact),
     payload,
   };
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+    throw new Error(`${label} must be a non-negative safe integer`);
+  return value;
 }
 
 function defined<Key extends string, Value>(

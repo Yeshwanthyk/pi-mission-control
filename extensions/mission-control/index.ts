@@ -2,7 +2,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
-  ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -11,133 +10,88 @@ import {
   hasMissionPolicy,
   missionPolicy,
 } from "../../src/context-prompt.ts";
-import { createMissionPresenter } from "../../src/presenter.ts";
-import { ProjectionRegistry } from "../../src/projections.ts";
-import { PassiveSourceAdapter } from "../../src/source-adapter.ts";
+import { ArtifactRouter } from "../../src/artifacts/artifact-router.ts";
+import { renderDiffPage } from "../../src/artifacts/diff-renderer.ts";
+import { GlimpseArtifactViewer } from "../../src/artifacts/glimpse-viewer.ts";
+import {
+  artifactCapability,
+  escapeHtml,
+  readVerifiedText,
+} from "../../src/artifacts/media-policy.ts";
+import { MissionIndex } from "../../src/mission-index.ts";
+import { MissionPlanStore } from "../../src/mission-plan-store.ts";
+import {
+  buildMissionProjection,
+  projectionToPlain,
+} from "../../src/mission-projection.ts";
+import type {
+  MissionProjection,
+  MissionSourceSnapshot,
+} from "../../src/mission-types.ts";
+import { MissionRecordService } from "../../src/mission-record-service.ts";
+import { OperatorBoardController } from "../../src/operator-board.ts";
 import { MissionStore } from "../../src/store.ts";
-import { runMission } from "../../src/runtime.ts";
+import { OperatorBoardComponent } from "../../src/tui/operator-board-component.ts";
 import type {
   EvidenceArtifactInput,
-  EvidenceReceipt,
-  JsonValue,
   MissionContext,
   MissionContextReference,
 } from "../../src/types.ts";
 import { asJsonValue } from "../../src/validation.ts";
+import { runMission } from "../../src/runtime.ts";
 import { wrapWorkflowScript } from "../../src/workflow-wrap.ts";
 
 const CONTEXT_ENTRY_TYPE = "pi.mission-context-ref/v1";
 const STATUS_KEY = "mission-control";
 
 const ArtifactParameter = Type.Object({
-  role: Type.String({
-    description:
-      "Artifact role, such as diff, screenshot, report, test-log, or video",
-  }),
+  role: Type.String(),
   label: Type.Optional(Type.String()),
-  path: Type.Optional(
-    Type.String({ description: "Path to a closed artifact file" }),
-  ),
-  content: Type.Optional(
-    Type.String({ description: "Inline textual artifact content" }),
-  ),
+  path: Type.Optional(Type.String()),
+  content: Type.Optional(Type.String()),
   media_type: Type.Optional(Type.String()),
 });
-
 const MissionRecordParameters = Type.Object({
   title: Type.String({ description: "Human-readable milestone title" }),
-  kind: Type.Optional(
-    Type.String({ description: "Milestone kind; defaults to checkpoint" }),
-  ),
+  kind: Type.Optional(Type.String()),
   state: Type.Optional(
     StringEnum(["started", "completed", "failed", "cancelled"] as const),
   ),
   milestone_id: Type.Optional(Type.String()),
   parent_id: Type.Optional(Type.String()),
-  context_token: Type.Optional(
-    Type.String({ description: "Defaults to the active execution context" }),
-  ),
+  context_token: Type.Optional(Type.String()),
   artifacts: Type.Optional(Type.Array(ArtifactParameter)),
   payload: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
-
 type MissionRecordDetails = {
   readonly eventId: string;
   readonly contextToken: string;
-  readonly artifactPaths: readonly string[];
+  readonly artifactIds: readonly string[];
+  readonly linked: boolean;
 };
 
-interface AgentRunState {
-  active: boolean;
-  sequence: number;
-  toolCounts: Map<string, number>;
-  toolErrors: number;
-  editPatches: string[];
+interface ActiveBoard {
+  readonly controller: OperatorBoardController;
+  close(): void;
 }
 
 export default function missionControl(pi: ExtensionAPI): void {
   const store = new MissionStore();
-  const projections = new ProjectionRegistry();
-  const presenter = createMissionPresenter(store, projections);
-  const sourceAdapter = new PassiveSourceAdapter(store);
+  const plans = new MissionPlanStore();
+  const index = new MissionIndex();
+  const recordService = new MissionRecordService();
+  const artifactRouter = new ArtifactRouter();
+  const artifactViewer = new GlimpseArtifactViewer();
   const contexts = new Map<string, MissionContext>();
-  const activeTokens = new Set<string>();
-  const pendingLaunches = new Map<string, MissionContext>();
   let primaryToken: string | undefined;
-  let ensurePromise: Promise<MissionContext> | undefined;
-  let reconcileTimer: ReturnType<typeof setInterval> | undefined;
-  let reconciling = false;
-  const agentRun: AgentRunState = {
-    active: false,
-    sequence: 0,
-    toolCounts: new Map(),
-    toolErrors: 0,
-    editPatches: [],
-  };
+  let activeBoard: ActiveBoard | undefined;
 
   const primaryContext = (): MissionContext | undefined =>
-    primaryToken === undefined ? undefined : contexts.get(primaryToken);
-
-  const refreshPresenter = async (): Promise<void> => {
-    await presenter.refresh(activeTokens);
-  };
-
-  const reconcileSources = async (ctx: ExtensionContext): Promise<void> => {
-    if (reconciling) return;
-    reconciling = true;
-    try {
-      const snapshot = await runMission(store.snapshot(activeTokens));
-      const sessionId = ctx.sessionManager.getSessionId();
-      await runMission(sourceAdapter.reconcile(snapshot.contexts, sessionId));
-      await reconcileTaskBatches(
-        snapshot.contexts,
-        snapshot.receipts,
-        projections,
-        store,
-        sessionId,
-      );
-      await refreshPresenter();
-    } catch {
-      // Passive adapters retry; source tools must never be blocked by observation.
-    } finally {
-      reconciling = false;
-    }
-  };
-
-  const updateStatus = async (ctx: ExtensionContext): Promise<void> => {
-    if (ctx.mode !== "tui") return;
-    const receipts = await runMission(store.listReceipts(activeTokens));
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      activeTokens.size === 0
-        ? undefined
-        : `◆ ${activeTokens.size} context${activeTokens.size === 1 ? "" : "s"} · ${receipts.length} evidence`,
-    );
-  };
+    primaryToken ? contexts.get(primaryToken) : undefined;
 
   const appendContextReference = (
     context: MissionContext,
-    ctx: ExtensionContext,
+    makePrimary = false,
   ): void => {
     const reference: MissionContextReference = {
       schema: "pi.mission-context-ref/v1",
@@ -148,111 +102,77 @@ export default function missionControl(pi: ExtensionAPI): void {
       createdAt: context.createdAt,
     };
     pi.appendEntry(CONTEXT_ENTRY_TYPE, reference);
-    activeTokens.add(context.token);
     contexts.set(context.token, context);
-    void updateStatus(ctx);
-  };
-
-  const ensureSessionContext = async (
-    ctx: ExtensionContext,
-    requestedTitle?: string,
-  ): Promise<MissionContext> => {
-    const existing = primaryContext();
-    if (existing) return existing;
-    if (ensurePromise) return ensurePromise;
-    ensurePromise = (async () => {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const context = await runMission(
-        store.createContext({
-          missionId: `mission:${sessionId}`,
-          title:
-            requestedTitle?.trim().slice(0, 120) ||
-            `Session ${sessionId.slice(0, 8)}`,
-          cwd: ctx.cwd,
-          source: "session",
-          parentSessionId: sessionId,
-          ...defined(
-            "originLeafId",
-            ctx.sessionManager.getLeafId() ?? undefined,
-          ),
-        }),
-      );
-      primaryToken = context.token;
-      appendContextReference(context, ctx);
-      return context;
-    })();
-    try {
-      return await ensurePromise;
-    } finally {
-      ensurePromise = undefined;
-    }
+    if (makePrimary) primaryToken = context.token;
   };
 
   const hydrateBranch = async (ctx: ExtensionContext): Promise<void> => {
-    activeTokens.clear();
     contexts.clear();
     primaryToken = undefined;
-    const references: MissionContextReference[] = [];
+    let fallbackToken: string | undefined;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== CONTEXT_ENTRY_TYPE)
         continue;
       const reference = parseContextReference(entry.data);
-      if (reference) references.push(reference);
-    }
-    for (const reference of references) {
+      if (!reference) continue;
       const context = await runMission(store.getContext(reference.token));
       if (!context) continue;
-      activeTokens.add(context.token);
       contexts.set(context.token, context);
+      fallbackToken = context.token;
       if (context.source === "session") primaryToken = context.token;
     }
-    await updateStatus(ctx);
-    await refreshPresenter();
+    primaryToken ??= fallbackToken;
   };
 
-  const createChildContext = async (
-    source: "workflow" | "subagent" | "task",
-    title: string,
-    toolCallId: string,
+  const projectionForSession = async (
     ctx: ExtensionContext,
-    sourceId = toolCallId,
-  ): Promise<MissionContext> => {
-    const parent = await ensureSessionContext(ctx);
-    const context = await runMission(
-      store.createContext({
-        missionId: parent.missionId,
-        title: title.slice(0, 160),
-        cwd: ctx.cwd,
-        source,
-        parentSessionId: ctx.sessionManager.getSessionId(),
-        ...defined("originLeafId", ctx.sessionManager.getLeafId() ?? undefined),
-        parentToolCallId: toolCallId,
-        parentContextToken: parent.token,
-        sourceId,
-      }),
-    );
-    appendContextReference(context, ctx);
-    pendingLaunches.set(toolCallId, context);
-    await runMission(
-      store.recordEvidence({
-        contextToken: context.token,
-        producer: {
-          kind: `${source}-launcher`,
-          instanceId: toolCallId,
-          sessionId: ctx.sessionManager.getSessionId(),
-          toolCallId,
-        },
-        milestone: {
-          id: `${context.token}:launch`,
-          kind: `${source}-launch`,
-          state: "started",
-          title: `${title} requested`,
-          occurredAt: new Date().toISOString(),
-        },
-        payload: {},
-      }),
-    );
-    return context;
+  ): Promise<MissionProjection> => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const binding = await plans.getBinding(sessionId);
+    if (
+      !binding ||
+      binding.state !== "bound" ||
+      !binding.missionId ||
+      !binding.itemId
+    ) {
+      return buildMissionProjection(emptySnapshot());
+    }
+    return buildMissionProjection(await index.snapshot(binding.missionId));
+  };
+
+  const openArtifact = async (
+    artifactId: string,
+    ctx: ExtensionContext,
+  ): Promise<void> => {
+    const result = await artifactRouter.resolve(artifactId);
+    if (result.status !== "available") {
+      ctx.ui.notify(`Artifact unavailable: ${result.reason}`, "warning");
+      return;
+    }
+    const descriptor = result.value;
+    try {
+      const diff = artifactCapability(descriptor, "diff");
+      if (diff.status === "available") {
+        await artifactViewer.open(
+          await renderDiffPage(descriptor, `Artifact ${descriptor.artifactId}`),
+          `Artifact ${descriptor.artifactId}`,
+        );
+        return;
+      }
+      const text = artifactCapability(descriptor, "text");
+      if (text.status === "available") {
+        const source = readVerifiedText(descriptor);
+        const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>Artifact</title><style>body{margin:0;padding:16px;background:Canvas;color:CanvasText}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}</style></head><body><pre>${escapeHtml(source)}</pre></body></html>`;
+        await artifactViewer.open(html, `Artifact ${descriptor.artifactId}`);
+        return;
+      }
+      ctx.ui.notify(
+        `No bounded internal viewer for ${descriptor.mediaType}`,
+        "warning",
+      );
+    } finally {
+      artifactRouter.close(descriptor);
+    }
   };
 
   pi.registerTool<typeof MissionRecordParameters, MissionRecordDetails>({
@@ -267,112 +187,219 @@ export default function missionControl(pi: ExtensionAPI): void {
     ],
     parameters: MissionRecordParameters,
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      let context: MissionContext | undefined;
-      if (params.context_token) {
-        context =
-          contexts.get(params.context_token) ??
-          (await runMission(store.getContext(params.context_token)));
-      } else {
-        context = primaryContext() ?? (await ensureSessionContext(ctx));
+      const sessionId = ctx.sessionManager.getSessionId();
+      const binding = await plans.getBinding(sessionId);
+      const suppliedContextToken = params.context_token;
+      const explicitContext = suppliedContextToken !== undefined;
+      let context = suppliedContextToken
+        ? (contexts.get(suppliedContextToken) ??
+          (await runMission(store.getContext(suppliedContextToken))))
+        : primaryContext();
+      if (
+        !explicitContext &&
+        binding?.state === "bound" &&
+        binding.missionId &&
+        (!context ||
+          context.missionId !== binding.missionId ||
+          context.parentSessionId !== sessionId)
+      ) {
+        context = await runMission(
+          store.createContext({
+            missionId: binding.missionId,
+            title: `Session ${sessionId.slice(0, 8)}`,
+            cwd: ctx.cwd,
+            source: "session",
+            parentSessionId: sessionId,
+            ...defined(
+              "originLeafId",
+              ctx.sessionManager.getLeafId() ?? undefined,
+            ),
+          }),
+        );
+        appendContextReference(context, true);
       }
-      if (!context) throw new Error("Mission context is unavailable");
-      contexts.set(context.token, context);
-      activeTokens.add(context.token);
-      const receipt = await runMission(
-        store.recordEvidence({
-          contextToken: context.token,
-          producer: {
-            kind: "pi-agent",
-            instanceId: ctx.sessionManager.getSessionId(),
-            sessionId: ctx.sessionManager.getSessionId(),
-            toolCallId,
-          },
-          milestone: {
-            id:
-              params.milestone_id ??
-              `${context.token}:checkpoint:${Date.now().toString(36)}`,
-            ...defined("parentId", params.parent_id),
-            kind: params.kind ?? "checkpoint",
-            state: params.state ?? "completed",
-            title: params.title,
-            occurredAt: new Date().toISOString(),
-          },
-          artifacts: (params.artifacts ?? []).map(
-            (artifact): EvidenceArtifactInput => ({
-              role: artifact.role,
-              ...defined("label", artifact.label),
-              ...defined("path", artifact.path),
-              ...defined("content", artifact.content),
-              ...defined("mediaType", artifact.media_type),
-            }),
-          ),
-          payload: asJsonValue(params.payload ?? {}),
-        }),
-      );
-      await updateStatus(ctx);
-      await refreshPresenter();
+      if (!context) {
+        throw new Error(
+          "Mission recording is unbound. Supply an explicit context_token or bind this session with missionctl binding set.",
+        );
+      }
+      const evidence = {
+        contextToken: context.token,
+        producer: {
+          kind: "pi-agent",
+          instanceId: sessionId,
+          sessionId,
+          toolCallId,
+        },
+        milestone: {
+          id:
+            params.milestone_id ??
+            `${context.token}:checkpoint:${Date.now().toString(36)}`,
+          ...defined("parentId", params.parent_id),
+          kind: params.kind ?? "checkpoint",
+          state: params.state ?? "completed",
+          title: params.title,
+          occurredAt: new Date().toISOString(),
+        },
+        artifacts: (params.artifacts ?? []).map(
+          (artifact): EvidenceArtifactInput => ({
+            role: artifact.role,
+            ...defined("label", artifact.label),
+            ...defined("path", artifact.path),
+            ...defined("content", artifact.content),
+            ...defined("mediaType", artifact.media_type),
+          }),
+        ),
+        payload: asJsonValue(params.payload ?? {}),
+      };
+      const canLink =
+        !explicitContext &&
+        binding?.state === "bound" &&
+        binding.missionId === context.missionId &&
+        context.parentSessionId === sessionId &&
+        typeof binding.itemId === "string";
+      const eventId = canLink
+        ? (
+            await recordService.record({
+              missionId: binding.missionId,
+              itemId: binding.itemId,
+              sessionId,
+              idempotencyKey: `mission-record:${toolCallId}`,
+              classification: "semantic",
+              evidence,
+            })
+          ).eventId
+        : (await runMission(store.recordEvidence(evidence))).eventId;
+      const receipt = await runMission(store.getReceipt(eventId));
+      if (!receipt)
+        throw new Error(`Recorded receipt is unavailable: ${eventId}`);
+      void activeBoard?.controller.refresh();
       return {
         content: [
           {
             type: "text",
-            text: `Recorded ${receipt.milestone.state} milestone ${receipt.eventId} with ${receipt.artifacts.length} artifact(s).`,
+            text: `Recorded ${receipt.milestone.state} milestone ${eventId} with ${receipt.artifacts.length} artifact(s)${canLink ? " and linked it to the active roadmap item" : " as unassigned context evidence"}.`,
           },
         ],
         details: {
-          eventId: receipt.eventId,
-          contextToken: receipt.contextToken,
-          artifactPaths: receipt.artifacts.map((artifact) => artifact.path),
+          eventId,
+          contextToken: context.token,
+          artifactIds: receipt.artifacts.map((artifact) => artifact.artifactId),
+          linked: canLink,
         },
       };
     },
   });
 
   pi.registerCommand("mission", {
-    description: "Open Mission Control or show mission status",
+    description:
+      "Open the mission board or manage the explicit session binding",
     async handler(args, ctx) {
-      if (args.trim() === "close") {
-        presenter.close();
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const action = tokens[0];
+      if (action === "close") {
+        activeBoard?.close();
         return;
       }
-      await ensureSessionContext(ctx);
-      if (args.trim() === "status") {
-        const snapshot = await runMission(store.snapshot(activeTokens));
-        ctx.ui.notify(
-          `${snapshot.contexts.length} active context(s), ${snapshot.receipts.length} evidence receipt(s).`,
-          "info",
+      if (action === "bind") {
+        const [missionId, itemId, revisionText, idempotencyKey] =
+          tokens.slice(1);
+        if (!missionId || !itemId || !revisionText || !idempotencyKey)
+          throw new Error(
+            "/mission bind requires MISSION ITEM EXPECTED_REVISION IDEMPOTENCY_KEY",
+          );
+        await plans.setBinding({
+          sessionId: ctx.sessionManager.getSessionId(),
+          missionId,
+          itemId,
+          expectedRevision: nonNegativeInteger(revisionText),
+          idempotencyKey,
+        });
+        ctx.ui.notify(`Bound to ${missionId}/${itemId}`, "info");
+        return;
+      }
+      if (action === "unbind") {
+        const [revisionText, idempotencyKey] = tokens.slice(1);
+        if (!revisionText || !idempotencyKey)
+          throw new Error(
+            "/mission unbind requires EXPECTED_REVISION IDEMPOTENCY_KEY",
+          );
+        await plans.setBinding({
+          sessionId: ctx.sessionManager.getSessionId(),
+          expectedRevision: nonNegativeInteger(revisionText),
+          idempotencyKey,
+        });
+        ctx.ui.notify("Mission binding cleared", "info");
+        return;
+      }
+      if (action === "status" || action === "json") {
+        const projection = await projectionForSession(ctx);
+        const output =
+          action === "json"
+            ? JSON.stringify(projection)
+            : projectionToPlain(projection).trimEnd();
+        if (!ctx.hasUI)
+          throw new Error(
+            `${output}\nUse missionctl mission show --mission ID --plain|--json for non-interactive output.`,
+          );
+        ctx.ui.notify(output, "info");
+        return;
+      }
+      if (ctx.mode !== "tui") {
+        throw new Error(
+          "/mission board requires TUI mode. Use /mission status in RPC or missionctl mission show --mission ID --plain|--json.",
         );
+      }
+      if (activeBoard) {
+        ctx.ui.notify("Mission board is already open", "info");
         return;
       }
-      await presenter.open(ctx, activeTokens);
+      const controller = new OperatorBoardController(() =>
+        projectionForSession(ctx),
+      );
+      let component: OperatorBoardComponent | undefined;
+      let close = (): void => component?.close();
+      activeBoard = { controller, close: () => close() };
+      try {
+        await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+          let finished = false;
+          const finish = (): void => {
+            if (finished) return;
+            finished = true;
+            done();
+          };
+          component = new OperatorBoardComponent({
+            controller,
+            theme,
+            height: () => tui.terminal.rows,
+            done: finish,
+            requestRender: () => tui.requestRender(),
+            openArtifact: (artifactId) => openArtifact(artifactId, ctx),
+            ascii:
+              process.env.TERM === "dumb" ||
+              process.env.MISSION_CONTROL_ASCII === "1",
+          });
+          close = () => component?.close();
+          controller.start((state) => {
+            component?.setState(state);
+            tui.requestRender();
+          });
+          return component;
+        });
+      } finally {
+        controller.stop();
+        if (activeBoard?.controller === controller) activeBoard = undefined;
+      }
     },
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    await runMission(store.initialize());
     await hydrateBranch(ctx);
-    if (reconcileTimer) clearInterval(reconcileTimer);
-    reconcileTimer = setInterval(() => void reconcileSources(ctx), 1_000);
-    reconcileTimer.unref();
-    await reconcileSources(ctx);
   });
-
   pi.on("session_tree", async (_event, ctx) => {
     await hydrateBranch(ctx);
+    void activeBoard?.controller.refresh();
   });
-
-  pi.on("input", async (event, ctx) => {
-    if (event.source === "extension" || primaryContext()) return;
-    const title = titleFromPrompt(event.text);
-    try {
-      await ensureSessionContext(ctx, title);
-    } catch (error) {
-      ctx.ui.notify(
-        `Mission Control context failed: ${errorText(error)}`,
-        "warning",
-      );
-    }
-  });
-
   pi.on("before_agent_start", async (event, ctx) => {
     const inheritedToken =
       extractContextToken(event.prompt) ??
@@ -380,363 +407,154 @@ export default function missionControl(pi: ExtensionAPI): void {
     if (inheritedToken) {
       const inherited = await runMission(store.getContext(inheritedToken));
       if (inherited) {
-        const alreadyActive = activeTokens.has(inherited.token);
         contexts.set(inherited.token, inherited);
         primaryToken = inherited.token;
-        if (alreadyActive) activeTokens.add(inherited.token);
-        else appendContextReference(inherited, ctx);
+        if (
+          !ctx.sessionManager
+            .getBranch()
+            .some(
+              (entry) =>
+                entry.type === "custom" &&
+                entry.customType === CONTEXT_ENTRY_TYPE &&
+                parseContextReference(entry.data)?.token === inherited.token,
+            )
+        ) {
+          appendContextReference(inherited);
+        }
       }
     }
-    const context =
-      primaryContext() ??
-      (await ensureSessionContext(ctx, titleFromPrompt(event.prompt)));
-    if (hasMissionPolicy(event.systemPrompt)) return;
+    const context = primaryContext();
+    if (!context || hasMissionPolicy(event.systemPrompt)) return;
     return {
       systemPrompt: `${event.systemPrompt}\n\n${missionPolicy(context)}`,
     };
   });
-
   pi.on("tool_call", async (event, ctx) => {
+    const parent = primaryContext();
+    if (!parent) return;
     try {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const binding = await plans.getBinding(sessionId);
+      const promptBinding =
+        binding?.state === "bound" &&
+        binding.missionId === parent.missionId &&
+        typeof binding.itemId === "string"
+          ? {
+              missionId: binding.missionId,
+              itemId: binding.itemId,
+              sessionId,
+            }
+          : undefined;
       if (
-        event.toolName === "subagent_spawn" &&
-        typeof event.input.prompt === "string"
-      ) {
-        const requestedTitle =
-          typeof event.input.title === "string"
-            ? event.input.title
-            : typeof event.input.name === "string"
-              ? event.input.name
-              : undefined;
-        const title = requestedTitle?.trim() || "Subagent";
-        const context = await createChildContext(
-          "subagent",
-          title,
-          event.toolCallId,
-          ctx,
-        );
-        event.input.prompt = `${childPromptPrefix(context, store.paths.root)}\n\n${event.input.prompt}`;
-      } else if (
         event.toolName === "workflow" &&
         typeof event.input.script === "string"
       ) {
-        const context = await createChildContext(
+        const child = await createChildContext(
+          store,
+          parent,
           "workflow",
           "Workflow",
           event.toolCallId,
           ctx,
         );
+        appendContextReference(child);
         event.input.script = wrapWorkflowScript(
           event.input.script,
-          childPromptPrefix(context, store.paths.root),
+          childPromptPrefix(child, store.paths.root, promptBinding),
         );
+      } else if (
+        event.toolName === "subagent_spawn" &&
+        typeof event.input.prompt === "string"
+      ) {
+        const child = await createChildContext(
+          store,
+          parent,
+          "subagent",
+          typeof event.input.title === "string"
+            ? event.input.title
+            : "Subagent",
+          event.toolCallId,
+          ctx,
+        );
+        appendContextReference(child);
+        event.input.prompt = `${childPromptPrefix(child, store.paths.root, promptBinding)}\n\n${event.input.prompt}`;
       } else if (event.toolName === "TaskExecute") {
         const taskIds = Array.isArray(event.input.task_ids)
           ? event.input.task_ids.filter(
               (taskId): taskId is string => typeof taskId === "string",
             )
           : [];
-        const taskLabel =
-          taskIds.length === 0
-            ? "Task execution"
-            : `Tasks ${taskIds.map((taskId) => `#${taskId}`).join(", ")}`;
-        const context = await createChildContext(
+        const child = await createChildContext(
+          store,
+          parent,
           "task",
-          taskLabel,
+          taskIds.length > 0 ? `Tasks ${taskIds.join(", ")}` : "Task execution",
           event.toolCallId,
           ctx,
-          `tasks:${taskIds.join(",")}`,
         );
+        appendContextReference(child);
         const current =
           typeof event.input.additional_context === "string"
             ? event.input.additional_context
             : "";
-        event.input.additional_context = `${current}${current ? "\n\n" : ""}${childPromptPrefix(
-          context,
-          store.paths.root,
-        )}`;
+        event.input.additional_context = `${current}${current ? "\n\n" : ""}${childPromptPrefix(child, store.paths.root, promptBinding)}`;
       }
     } catch (error) {
       ctx.ui.notify(
-        `Mission context propagation failed: ${errorText(error)}`,
+        `Mission context propagation failed: ${error instanceof Error ? error.message : String(error)}`,
         "warning",
       );
     }
   });
-
-  pi.on("tool_result", async (event, ctx) => {
-    collectToolResult(event, agentRun);
-    projections.observeTaskResult(
-      event.toolName,
-      event.input,
-      textContent(event),
-      event.isError,
-    );
-    try {
-      await recordTaskTransition(event, primaryContext(), store, ctx);
-    } catch {
-      // Task execution is authoritative; evidence observation remains best-effort.
-    }
-    const launch = pendingLaunches.get(event.toolCallId);
-    if (!launch) {
-      await reconcileSources(ctx);
-      return;
-    }
-    pendingLaunches.delete(event.toolCallId);
-    if (!event.isError) {
-      if (launch.source === "task") {
-        const launchedTaskIds = taskIdsFromLaunchResult(textContent(event));
-        if (launchedTaskIds.length === 0) {
-          await runMission(
-            store.recordEvidence({
-              eventId: `task_batch_${safeId(event.toolCallId)}_cancelled`,
-              contextToken: launch.token,
-              producer: {
-                kind: "pi-tasks",
-                instanceId: event.toolCallId,
-                sessionId: ctx.sessionManager.getSessionId(),
-                toolCallId: event.toolCallId,
-              },
-              milestone: {
-                id: `${launch.token}:task-run:cancelled`,
-                kind: "task-run",
-                state: "cancelled",
-                title: `${launch.title} did not launch`,
-                occurredAt: new Date().toISOString(),
-              },
-              payload: { result: textContent(event) },
-            }),
-          );
-        } else {
-          const updated = await runMission(
-            store.updateContextSourceId(
-              launch.token,
-              `tasks:${launchedTaskIds.join(",")}`,
-            ),
-          );
-          contexts.set(updated.token, updated);
-        }
-      }
-      await reconcileSources(ctx);
-      return;
-    }
-    await runMission(store.updateContextStatus(launch.token, "failed"));
-    await runMission(
-      store.recordEvidence({
-        contextToken: launch.token,
-        producer: {
-          kind: `${launch.source}-launcher`,
-          instanceId: event.toolCallId,
-          sessionId: ctx.sessionManager.getSessionId(),
-          toolCallId: event.toolCallId,
-        },
-        milestone: {
-          id: `${launch.token}:launch-failed`,
-          kind: `${launch.source}-launch`,
-          state: "failed",
-          title: `${launch.title} failed to launch`,
-          occurredAt: new Date().toISOString(),
-        },
-        payload: { error: textContent(event) },
-      }),
-    );
-    await updateStatus(ctx);
-    await refreshPresenter();
-  });
-
-  pi.on("agent_start", () => {
-    if (agentRun.active) return;
-    agentRun.active = true;
-    agentRun.sequence++;
-    agentRun.toolCounts.clear();
-    agentRun.toolErrors = 0;
-    agentRun.editPatches = [];
-  });
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (!agentRun.active) return;
-    agentRun.active = false;
-    const context = primaryContext();
-    if (!context) return;
-    const sessionId = ctx.sessionManager.getSessionId();
-    const toolCounts: Record<string, JsonValue> = {};
-    for (const [name, count] of agentRun.toolCounts) toolCounts[name] = count;
-    const settledKind =
-      context.source === "workflow"
-        ? "workflow-agent-turn"
-        : context.source === "task"
-          ? "task-agent-turn"
-          : "agent-turn";
-    await runMission(
-      store.recordEvidence({
-        contextToken: context.token,
-        producer: {
-          kind: "pi-session",
-          instanceId: sessionId,
-          sessionId,
-        },
-        milestone: {
-          id: `${context.token}:${sessionId}:settled:${agentRun.sequence}`,
-          kind: settledKind,
-          state: "completed",
-          title:
-            context.source === "session"
-              ? "Agent turn settled"
-              : `${context.title} turn settled`,
-          occurredAt: new Date().toISOString(),
-        },
-        artifacts:
-          agentRun.editPatches.length === 0
-            ? []
-            : [
-                {
-                  role: "diff",
-                  label: "Edit patches",
-                  content: agentRun.editPatches.join("\n\n"),
-                  mediaType: "text/x-diff",
-                },
-              ],
-        payload: { toolCounts, toolErrors: agentRun.toolErrors },
-      }),
-    );
-    await updateStatus(ctx);
-    await reconcileSources(ctx);
-  });
-
   pi.on("session_shutdown", (_event, ctx) => {
-    presenter.close();
-    if (reconcileTimer) clearInterval(reconcileTimer);
-    reconcileTimer = undefined;
+    activeBoard?.close();
+    activeBoard?.controller.stop();
+    activeBoard = undefined;
+    artifactViewer.close();
     if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 }
 
-async function reconcileTaskBatches(
-  contexts: readonly MissionContext[],
-  receipts: readonly EvidenceReceipt[],
-  projections: ProjectionRegistry,
+async function createChildContext(
   store: MissionStore,
-  sessionId: string,
-): Promise<void> {
-  const taskContexts = contexts.filter(
-    (context) =>
-      context.source === "task" &&
-      context.status === "active" &&
-      context.sourceId?.startsWith("tasks:"),
-  );
-  if (taskContexts.length === 0) return;
-  const projection = await projections.snapshot(contexts, receipts, sessionId);
-  const tasksById = new Map(projection.tasks.map((task) => [task.id, task]));
-  for (const context of taskContexts) {
-    const sourceId = context.sourceId;
-    if (!sourceId) continue;
-    const taskIds = sourceId.slice("tasks:".length).split(",").filter(Boolean);
-    if (
-      taskIds.length === 0 ||
-      !taskIds.every((taskId) => tasksById.get(taskId)?.status === "completed")
-    ) {
-      continue;
-    }
-    await runMission(
-      store.recordEvidence({
-        eventId: `source_task_batch_${safeId(context.token)}_terminal`,
-        contextToken: context.token,
-        producer: {
-          kind: "pi-tasks",
-          instanceId: sourceId,
-          sessionId,
-          ...defined("toolCallId", context.parentToolCallId),
-        },
-        milestone: {
-          id: `${context.token}:task-run:completed`,
-          kind: "task-run",
-          state: "completed",
-          title: `${context.title} completed`,
-          occurredAt: new Date().toISOString(),
-        },
-        payload: { taskIds },
-      }),
-    );
-  }
-}
-
-async function recordTaskTransition(
-  event: ToolResultEvent,
-  context: MissionContext | undefined,
-  store: MissionStore,
+  parent: MissionContext,
+  source: "workflow" | "subagent" | "task",
+  title: string,
+  toolCallId: string,
   ctx: ExtensionContext,
-): Promise<void> {
-  if (
-    event.toolName !== "TaskUpdate" ||
-    event.isError ||
-    !context ||
-    !/^Updated task #/m.test(textContent(event))
-  )
-    return;
-  const taskId =
-    typeof event.input.taskId === "string" ? event.input.taskId : undefined;
-  const requestedStatus = event.input.status;
-  const state =
-    requestedStatus === "in_progress"
-      ? "started"
-      : requestedStatus === "completed"
-        ? "completed"
-        : undefined;
-  if (!taskId || !state) return;
-  const safeCallId = event.toolCallId
-    .replace(/[^A-Za-z0-9._-]/g, "_")
-    .slice(0, 100);
-  await runMission(
-    store.recordEvidence({
-      eventId: `task_${taskId}_${safeCallId}`,
-      contextToken: context.token,
-      producer: {
-        kind: "pi-tasks",
-        instanceId: taskId,
-        sessionId: ctx.sessionManager.getSessionId(),
-        toolCallId: event.toolCallId,
-      },
-      milestone: {
-        id: `task:${taskId}:${state}:${safeCallId}`,
-        kind: "task-state",
-        state,
-        title: `Task #${taskId} ${state === "started" ? "started" : "completed"}`,
-        occurredAt: new Date().toISOString(),
-      },
-      payload: {
-        taskId,
-        ...(typeof event.input.subject === "string"
-          ? { subject: event.input.subject }
-          : {}),
-      },
+): Promise<MissionContext> {
+  return runMission(
+    store.createContext({
+      missionId: parent.missionId,
+      title: title.slice(0, 160),
+      cwd: ctx.cwd,
+      source,
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      ...defined("originLeafId", ctx.sessionManager.getLeafId() ?? undefined),
+      parentToolCallId: toolCallId,
+      parentContextToken: parent.token,
+      sourceId: toolCallId,
     }),
   );
 }
 
-function taskIdsFromLaunchResult(output: string): string[] {
-  return [...output.matchAll(/^#(\S+)\s+→\s+agent\s+/gm)].flatMap((match) =>
-    match[1] ? [match[1]] : [],
-  );
-}
-
-function safeId(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
-}
-
-function collectToolResult(event: ToolResultEvent, state: AgentRunState): void {
-  state.toolCounts.set(
-    event.toolName,
-    (state.toolCounts.get(event.toolName) ?? 0) + 1,
-  );
-  if (event.isError) state.toolErrors++;
-  if (
-    event.toolName !== "edit" ||
-    !event.details ||
-    typeof event.details !== "object"
-  )
-    return;
-  const patch = (event.details as Record<string, unknown>).patch;
-  if (typeof patch === "string" && patch.trim()) state.editPatches.push(patch);
+function emptySnapshot(): MissionSourceSnapshot {
+  return {
+    schema: "pi.mission-source-snapshot/v1",
+    missionId: "",
+    generation: -1,
+    projectionRevision: "unbound",
+    plan: null,
+    sessions: [],
+    sessionBindings: [],
+    executionBindings: [],
+    evidenceLinks: [],
+    contexts: [],
+    receipts: [],
+    pendingOperations: [],
+    unassigned: [],
+    conflicts: [],
+  };
 }
 
 function parseContextReference(
@@ -749,20 +567,14 @@ function parseContextReference(
     record.schema !== "pi.mission-context-ref/v1" ||
     typeof record.token !== "string" ||
     typeof record.missionId !== "string" ||
-    typeof record.source !== "string" ||
-    typeof record.createdAt !== "string"
-  ) {
+    typeof record.createdAt !== "string" ||
+    (record.source !== "session" &&
+      record.source !== "workflow" &&
+      record.source !== "subagent" &&
+      record.source !== "task" &&
+      record.source !== "cli")
+  )
     return undefined;
-  }
-  if (
-    record.source !== "session" &&
-    record.source !== "workflow" &&
-    record.source !== "subagent" &&
-    record.source !== "task" &&
-    record.source !== "cli"
-  ) {
-    return undefined;
-  }
   return {
     schema: "pi.mission-context-ref/v1",
     token: record.token,
@@ -776,33 +588,11 @@ function parseContextReference(
   };
 }
 
-function titleFromPrompt(prompt: string): string {
-  const withoutContext = prompt.replace(
-    /<pi-execution-context[^>]*\/?>(?:<\/pi-execution-context>)?/g,
-    "",
-  );
-  const firstLine = withoutContext
-    .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean);
-  return (firstLine ?? "Pi mission").slice(0, 120);
-}
-
-function textContent(event: ToolResultEvent): string {
-  return event.content
-    .filter(
-      (
-        item,
-      ): item is Extract<(typeof event.content)[number], { type: "text" }> =>
-        item.type === "text",
-    )
-    .map((item) => item.text)
-    .join("\n")
-    .slice(0, 4_000);
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function nonNegativeInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0)
+    throw new Error("expected revision must be a non-negative integer");
+  return parsed;
 }
 
 function defined<Key extends string, Value>(

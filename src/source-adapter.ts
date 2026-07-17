@@ -6,8 +6,6 @@ import { MissionStore } from "./store.ts";
 import { storage } from "./effect.ts";
 import type { EvidenceArtifactInput, MissionContext } from "./types.ts";
 
-const MATCH_WINDOW_MS = 30_000;
-
 export class PassiveSourceAdapter {
   private readonly store: MissionStore;
 
@@ -78,24 +76,18 @@ export function assignWorkflowContexts(
   contexts: readonly MissionContext[],
   runs: readonly WorkflowProjection[],
 ): ReadonlyMap<WorkflowProjection, MissionContext> {
+  const byRunId = new Map<string, MissionContext>();
+  for (const context of contexts) {
+    if (context.source !== "workflow" || !context.sourceId) continue;
+    if (byRunId.has(context.sourceId)) continue;
+    byRunId.set(context.sourceId, context);
+  }
   const assignments = new Map<WorkflowProjection, MissionContext>();
-  const available = new Set(contexts);
-  for (const run of [...runs].sort(
-    (left, right) => left.startedAt - right.startedAt,
-  )) {
-    let best: MissionContext | undefined;
-    let bestDistance = Number.POSITIVE_INFINITY;
-    for (const context of available) {
-      const distance = Math.abs(run.startedAt - Date.parse(context.createdAt));
-      if (distance <= MATCH_WINDOW_MS && distance < bestDistance) {
-        best = context;
-        bestDistance = distance;
-      }
-    }
-    if (best) {
-      assignments.set(run, best);
-      available.delete(best);
-    }
+  for (const run of runs) {
+    const context = byRunId.get(run.runId);
+    if (!context) continue;
+    if (run.sessionId && context.parentSessionId !== run.sessionId) continue;
+    assignments.set(run, context);
   }
   return assignments;
 }

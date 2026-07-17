@@ -4,7 +4,11 @@ import { assignWorkflowContexts } from "../src/source-adapter.ts";
 import type { MissionContext } from "../src/types.ts";
 import type { WorkflowProjection } from "../src/projections.ts";
 
-function context(token: string, createdAt: number): MissionContext {
+function context(
+  token: string,
+  createdAt: number,
+  sourceId?: string,
+): MissionContext {
   return {
     schema: "pi.mission-context/v1",
     token,
@@ -13,6 +17,7 @@ function context(token: string, createdAt: number): MissionContext {
     cwd: "/tmp",
     source: "workflow",
     parentSessionId: "session",
+    ...(sourceId ? { sourceId } : {}),
     createdAt: new Date(createdAt).toISOString(),
     status: "active",
   };
@@ -30,10 +35,10 @@ function run(runId: string, startedAt: number): WorkflowProjection {
   };
 }
 
-test("workflow reconciliation assigns nearest launch context once", () => {
+test("workflow reconciliation assigns exact run identities once", () => {
   const base = Date.now();
-  const first = context("first", base);
-  const second = context("second", base + 2_000);
+  const first = context("first", base, "wf_first");
+  const second = context("second", base + 2_000, "wf_second");
   const firstRun = run("wf_first", base + 100);
   const secondRun = run("wf_second", base + 2_100);
   const assigned = assignWorkflowContexts(
@@ -44,11 +49,11 @@ test("workflow reconciliation assigns nearest launch context once", () => {
   assert.equal(assigned.get(secondRun)?.token, "second");
 });
 
-test("workflow reconciliation ignores unrelated old runs", () => {
+test("workflow reconciliation never falls back to timestamps", () => {
   const now = Date.now();
   const assigned = assignWorkflowContexts(
     [context("current", now)],
-    [run("wf_old", now - 60_000)],
+    [run("wf_current", now)],
   );
   assert.equal(assigned.size, 0);
 });

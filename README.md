@@ -1,23 +1,8 @@
 # pi-mission-control
 
-## Effect boundary
+Terminal-first mission planning, cross-session attribution, and immutable evidence for Pi. The default `/mission` surface is a Pi TUI component; Glimpse is used only for bounded artifact viewing.
 
-Mission Control uses Effect v4 for all authoritative store operations and passive source reconciliation. Those modules return typed effects; only the Pi extension and `missionctl` cross into `src/runtime.ts`, the single `runPromiseExit` boundary. Filesystem failures are normalized at the Node I/O edge, while event locking, immutable artifact publication, and terminal-state updates remain composable `Effect.gen` programs.
-
-Independent Pi extension for mission progress, child-execution context, and durable evidence artifacts in a focused Glimpse window.
-
-It does **not** import or modify `pi-tasks`, `pi-workflows`, or `pi-subagents`.
-
-## Features
-
-- `/mission` opens or focuses a native Glimpse Mission Control window.
-- `mission_record` commits semantic milestones with immutable artifact snapshots.
-- `missionctl` gives Claude, Codex, shell processes, and other external producers the same durable evidence path.
-- Dynamic mission policy is injected with `before_agent_start`; no `AGENTS.md` mutation.
-- Session entries contain branch-linked context references but do not enter model context.
-- Subagent prompts, task execution context, and workflow `agent()` prompts receive opaque mission context without producer changes.
-- Workflow/task/subagent state is projected from public tool results and existing persisted artifacts.
-- Diff evidence opens in Quickdiff from the Mission Control window.
+The package does **not** import or modify `pi-tasks`, `pi-workflows`, or `pi-subagents`.
 
 ## Install
 
@@ -25,17 +10,87 @@ It does **not** import or modify `pi-tasks`, `pi-workflows`, or `pi-subagents`.
 pi install /Users/yesh/code/personal/pi-mission-control
 ```
 
-Then restart Pi or run `/reload`.
+Restart Pi or run `/reload`.
 
-## Pi commands
+## Operator workflow
 
-```text
-/mission          Open or focus Mission Control
-/mission status   Show active context/evidence counts
-/mission close    Close the window; collection continues
+Mission state is explicit. Opening `/mission` never creates a mission, plan, membership, binding, context, or evidence record.
+
+```bash
+# Create a plan from a validated pi.mission-plan/v1 document.
+missionctl plan create \
+  --stdin \
+  --idempotency-key workflow-plan-v1 < plan.json
+
+# Add this Pi session as an explicit mission member.
+missionctl session add \
+  --stdin \
+  --idempotency-key add-session-01 < session.json
+
+# Bind the session to one exact roadmap item.
+missionctl binding set \
+  --session "$PI_SESSION_ID" \
+  --mission workflow \
+  --item wp8 \
+  --expected-revision 0 \
+  --idempotency-key bind-session-01
+
+# Scriptable views use the same projection as the TUI.
+missionctl mission show --mission workflow --plain
+missionctl mission show --mission workflow --json
+missionctl artifact verify EVENT_ID:ARTIFACT_INDEX
 ```
 
-## Evidence tool
+Bindings are CAS-protected and durable. A new fork starts unbound unless copied explicitly:
+
+```bash
+missionctl binding fork \
+  --from SOURCE_SESSION_ID \
+  --session NEW_SESSION_ID \
+  --expected-revision 0 \
+  --idempotency-key fork-binding-01
+```
+
+Within Pi:
+
+```text
+/mission                         Open the terminal board (TUI mode only)
+/mission status                  Plain status via TUI/RPC notification
+/mission json                    JSON projection via TUI/RPC notification
+/mission close                   Close the open board
+/mission bind M I REV KEY        Explicitly bind this session
+/mission unbind REV KEY          Explicitly clear this session binding
+```
+
+For print/JSON modes, use `missionctl mission show`; Pi custom components are intentionally TUI-only.
+
+### Empty and missing-plan states
+
+An unbound session shows setup guidance without writing to the store. A bound mission without a readable plan shows a missing-plan board. Neither state infers membership, creates `mission:${sessionId}`, or starts background reconciliation.
+
+## Board behavior
+
+The board shows:
+
+- explicit mission state, remaining ETA, and provenance-backed change totals;
+- current and upcoming top-level roadmap items in plan order;
+- completed semantic milestones only;
+- nested items, executions, conflicts, and artifact IDs in item detail.
+
+Controls:
+
+```text
+↑/↓ or j/k  select
+enter       detail or artifact action
+tab         next detail section
+r           refresh
+?           help
+esc         back or close
+```
+
+The board refresh interval exists only while `ctx.ui.custom()` is open. Close, repeated close, reload, shutdown, and late refresh completion are idempotent. `MISSION_CONTROL_ASCII=1` enables ASCII markers.
+
+## Evidence
 
 Pi agents receive `mission_record`:
 
@@ -52,106 +107,66 @@ Pi agents receive `mission_record`:
 }
 ```
 
-A completed receipt is published only after all artifact files are copied, closed, hashed, and committed.
+With an exact persisted session binding, omitted `context_token` records and links semantic evidence to the active item. An explicit context token remains compatible with raw `pi.evidence/v1` storage and is reported as unassigned unless separately linked. Ambiguous unbound recording fails with setup guidance.
 
-## CLI
-
-The package exposes `missionctl`. Child prompts also contain a package-local absolute invocation, so global PATH installation is not required.
+External producers can use the compatibility surface:
 
 ```bash
-# Create a context manually
-missionctl context-create \
-  --mission demo \
-  --title "Demo mission" \
-  --cwd "$PWD"
-
-# Record using an explicit token
-missionctl record \
-  --context mc_... \
-  --title "Report ready" \
-  --kind checkpoint \
-  --state completed \
-  --artifact report=/tmp/report.md
-
-# External child: PI_EXECUTION_CONTEXT is used by default
-missionctl record \
-  --title "Agent completed" \
-  --kind agent-run \
-  --state completed \
-  --artifact result=/tmp/result.json
-
-# Structured producer input
-printf '%s' "$EVIDENCE_JSON" | missionctl record --stdin
-
+missionctl context-create --mission workflow --title "Worker" --cwd "$PWD"
+missionctl record --context mc_... --title "Report ready" --artifact report=/tmp/report.md
+missionctl record --context mc_... --mission workflow --item wp8 --session "$PI_SESSION_ID" \
+  --idempotency-key report-ready-v1 --title "Report ready"
+missionctl record --stdin
 missionctl list --context mc_...
 missionctl show ev_...
-missionctl contexts
+missionctl link execution --stdin --idempotency-key execution-01 < execution.json
+missionctl migrate index --stdin < legacy-mapping.json
 ```
 
-Environment:
+## Artifact security
 
-- `MISSION_CONTROL_HOME`: override the evidence store root.
-- `PI_EXECUTION_CONTEXT`: default context token for `missionctl record`.
-- `PI_TASK_LIST_ID`: enables projection of the configured file-backed pi-tasks list.
+UI actions carry only opaque `artifactId` values. Resolution scans immutable receipt data for an exact ID and then:
 
-## Storage
+1. rejects malformed/unknown/duplicate IDs;
+2. rejects root, intermediate, and leaf symlinks, traversal, non-files, replacement, and metadata conflicts;
+3. opens with no-follow semantics and verifies inode, size, and SHA-256 from the descriptor;
+4. lets internal text/diff viewers consume only verified descriptor bytes;
+5. gives external viewers only a controller-owned, hash-named, mode-`0400` copy.
+
+External viewer routes are typed executable/argv records with exactly one `verifiedPath` placeholder. They use `spawn(executable, argv, { shell: false })`; labels and UI values never become executables or argv tokens.
+
+Diffs use exactly `@pierre/diffs@1.2.12` SSR APIs. Generated pages are read-only, bounded, CSP-restricted, and contain no remote resources or artifact-provided CSS/scripts. Text, JSON, Markdown, malformed diffs, and HTML source are escaped. Unsupported or oversized media is unavailable rather than opened through an implicit system command.
+
+Glimpse is an artifact-focused HTML adapter only. There is no Glimpse mission dashboard and no Quickdiff shell route.
+
+## Persistence and compatibility
 
 Default root:
 
 ```text
 ~/.pi/agent/mission-control/
-  contexts/    opaque execution context records
-  receipts/    committed pi.evidence/v1 manifests
-  artifacts/   immutable artifact snapshots
-  staging/     incomplete writes, never displayed
-  locks/       per-event writer serialization
+  manifest.json
+  plans/  mission-generations/  mission-current/
+  mission-sessions/  session-bindings/  binding-history/
+  mission-links/  mission-operations/  migrations/
+  contexts/  receipts/  artifacts/  staging/  locks/
+  quarantine/orphans/
 ```
 
-Artifact commit sequence:
+Logical IDs never become path components; new records use namespaced SHA-256 storage keys. Mission generations provide one commit point for plan, membership, binding, execution, context, receipt, and evidence-link catalogs.
 
-1. Copy/write into an exclusive staging directory.
-2. Flush each file, compute SHA-256, and flush the staging directory.
-3. Atomically rename the artifact directory and flush its parent.
-4. Flush and atomically publish the receipt manifest.
-5. Settle only a matching terminal kind: `agent-run` for subagents, `workflow-run` for workflows, or `task-run` for task batches.
+Existing `pi.evidence/v1`, `pi.mission-context/v1`, and `pi.mission-context-ref/v1` files remain readable. Legacy colon artifact IDs resolve by exact receipt lookup. Migration/indexing is additive and never rewrites or renames legacy receipts, contexts, or artifact bytes.
 
-`eventId` is the idempotency key. Locks fail closed: an abandoned lock is never removed automatically because unlinking a lock that may have been replaced can permit concurrent writers. After verifying its recorded PID is dead, remove that event's lock manually before retrying the same `eventId`. New event IDs are unaffected.
-
-## Integration without producer changes
-
-### Pi sessions
-
-The extension uses `before_agent_start`, tool lifecycle hooks, `agent_settled`, `appendEntry`, and `mission_record` directly. `agent_settled` records a non-terminal turn receipt because Pi does not expose the run outcome in that event.
-
-### pi-subagents
-
-`subagent_spawn.prompt` is prefixed during Pi's mutable `tool_call` hook. This works for Pi, Claude, and Codex backends because all consume the prompt field. Pi children load this extension normally; external children receive explicit `missionctl` instructions. A subagent context settles only when the child explicitly commits an `agent-run` terminal receipt; generic Pi settlement alone cannot distinguish success, failure, and cancellation.
-
-### pi-workflows
-
-The submitted workflow script is prefixed with a small wrapper that rebinds the sandbox's mutable `agent()` parameter. Every nested `agent(prompt, options)` call receives the mission context. The original workflow package is unchanged.
-
-Terminal workflow state and its `script.js`, `transcripts.json`, and `result.json` sidecars are reconciled from `~/.pi/agent/workflows` after the producer's final atomic checkpoint.
-
-### pi-tasks
-
-Task state is projected from `TaskCreate`, `TaskUpdate`, and `TaskList` results. File-backed lists are also read from `~/.pi/tasks`. Successful `TaskUpdate` transitions produce task evidence receipts. `TaskExecute` uses one batch context, narrows it to the task IDs actually launched, and settles it only after every launched task is observed as completed.
-
-## Boundaries
-
-These are consequences of the no-producer-change constraint:
-
-- Workflow runs are correlated to their launch context by parent session and nearest start time within 30 seconds. Explicit producer context would be stronger.
-- Claude/Codex semantic evidence depends on the child following the injected `missionctl` contract; Pi cannot observe their private runtime directly.
-- Session-scoped in-memory pi-tasks state is reconstructed from observed tool results and therefore resets on extension reload. File-backed task lists survive reload. A background task batch can remain active until a later `TaskList` result exposes every terminal task.
-- Existing pi-tasks/subagent RPC compatibility issues are not changed or hidden by this package.
-- Glimpse is a projection only. Closing the window does not stop collection.
+Immutable artifact retry never deletes or overwrites a published directory. Exact output is reused, unreferenced mismatches are quarantined, and referenced mismatches fail closed.
 
 ## Development
 
 ```bash
-npm install
+npm ci
 npm run check
 npm test
 npm run format:check
+git diff --check
 ```
+
+The test suite covers legacy readability, publication idempotency, generation/CAS behavior, exact projection semantics, artifact routing and shell-free viewers, Pierre/CSP output, responsive TUI goldens, custom-UI lifecycle, and unbound no-write behavior.

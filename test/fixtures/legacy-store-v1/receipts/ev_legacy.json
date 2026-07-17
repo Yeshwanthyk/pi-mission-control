@@ -1,0 +1,28 @@
+{
+  "schema": "pi.evidence/v1",
+  "eventId": "ev_legacy",
+  "contextToken": "mc_legacy",
+  "producer": {
+    "kind": "legacy",
+    "sessionId": "session:legacy"
+  },
+  "milestone": {
+    "id": "legacy:milestone",
+    "kind": "checkpoint",
+    "state": "completed",
+    "title": "Legacy complete",
+    "occurredAt": "2025-01-01T00:00:00.000Z"
+  },
+  "artifacts": [
+    {
+      "artifactId": "ev_legacy:1",
+      "role": "report",
+      "path": "/legacy/store/artifacts/ev_legacy/01-artifact.txt",
+      "mediaType": "text/plain",
+      "size": 13,
+      "sha256": "15ff31362724a06547ab89cbd5d29574f2d4bf367f86757c0fbfb1f090060d80"
+    }
+  ],
+  "payload": {},
+  "recordedAt": "2025-01-01T00:00:00.000Z"
+}

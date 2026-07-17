@@ -1,0 +1,23 @@
+{
+  "100x20": [
+    "Unified operator board with a deliberately long title                                         ACTIVE",
+    "eta 12m                                                                                       +42/-7",
+    "",
+    "Roadmap",
+    "›■ Implement terminal board                                                               eta 4m  YK",
+    " □ Harden integration tests                                                                  eta 12m",
+    "",
+    "Progress",
+    "Secure artifact routing verified                                                              5m ago",
+    "  8 tests",
+    "↑↓ select · enter detail · r refresh · ? help · esc close"
+  ],
+  "40x6": [
+    "Unified operator board with a d\u001b[0m…\u001b[0m  ACTIVE",
+    "eta 12m",
+    "",
+    "Roadmap",
+    "›■ Implement terminal board       eta 4m",
+    "… 1 roadmap row(s) hidden"
+  ]
+}

@@ -8,6 +8,17 @@ export interface StorePaths {
   readonly artifacts: string;
   readonly staging: string;
   readonly locks: string;
+  readonly quarantine: string;
+  readonly plans: string;
+  readonly missionGenerations: string;
+  readonly missionCurrent: string;
+  readonly missionSessions: string;
+  readonly sessionBindings: string;
+  readonly bindingHistory: string;
+  readonly missionLinks: string;
+  readonly missionOperations: string;
+  readonly migrations: string;
+  readonly manifest: string;
 }
 
 export function defaultMissionControlRoot(
@@ -28,5 +39,16 @@ export function createStorePaths(
     artifacts: path.join(absoluteRoot, "artifacts"),
     staging: path.join(absoluteRoot, "staging"),
     locks: path.join(absoluteRoot, "locks"),
+    quarantine: path.join(absoluteRoot, "quarantine", "orphans"),
+    plans: path.join(absoluteRoot, "plans"),
+    missionGenerations: path.join(absoluteRoot, "mission-generations"),
+    missionCurrent: path.join(absoluteRoot, "mission-current"),
+    missionSessions: path.join(absoluteRoot, "mission-sessions"),
+    sessionBindings: path.join(absoluteRoot, "session-bindings"),
+    bindingHistory: path.join(absoluteRoot, "binding-history"),
+    missionLinks: path.join(absoluteRoot, "mission-links"),
+    missionOperations: path.join(absoluteRoot, "mission-operations"),
+    migrations: path.join(absoluteRoot, "migrations"),
+    manifest: path.join(absoluteRoot, "manifest.json"),
   };
 }

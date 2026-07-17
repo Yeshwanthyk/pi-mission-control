@@ -1,0 +1,11 @@
+{
+  "schema": "pi.mission-context/v1",
+  "token": "mc_legacy",
+  "missionId": "mission:/../雪",
+  "title": "Legacy mission",
+  "cwd": "/tmp/legacy",
+  "source": "cli",
+  "parentSessionId": "session:legacy",
+  "createdAt": "2025-01-01T00:00:00.000Z",
+  "status": "completed"
+}

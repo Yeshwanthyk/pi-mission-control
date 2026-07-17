@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
+import { ArtifactRouter } from "./artifacts/artifact-router.ts";
 import { cwd } from "node:process";
 import { MissionStore } from "./store.ts";
+import { MissionPlanStore } from "./mission-plan-store.ts";
+import { MissionIndex } from "./mission-index.ts";
+import { MissionMigrations } from "./mission-migrations.ts";
+import {
+  buildMissionProjection,
+  projectionToPlain,
+} from "./mission-projection.ts";
+import { MissionRecordService } from "./mission-record-service.ts";
 import { runMission } from "./runtime.ts";
 import type {
   EvidenceArtifactInput,
@@ -8,7 +17,7 @@ import type {
   MissionContextSource,
   RecordEvidenceInput,
 } from "./types.ts";
-import { asJsonValue } from "./validation.ts";
+import { asJsonValue, parseRecordEvidenceInput } from "./validation.ts";
 
 interface ParsedArguments {
   readonly command?: string;
@@ -30,7 +39,9 @@ export async function runCli(
       io.stdout(usage());
       return 0;
     }
-    const store = new MissionStore(option(parsed, "root"));
+    const root = option(parsed, "root");
+    const store = new MissionStore(root);
+    const plans = new MissionPlanStore(root);
     switch (parsed.command) {
       case "context-create": {
         const context = await runMission(
@@ -68,9 +79,32 @@ export async function runCli(
         return 0;
       }
       case "record": {
-        const input = has(parsed, "stdin")
-          ? await parseStdinEvidence(await io.readStdin(), parsed)
-          : evidenceFromFlags(parsed);
+        const input = parseRecordEvidenceInput(
+          has(parsed, "stdin")
+            ? await parseStdinEvidence(await io.readStdin(), parsed)
+            : evidenceFromFlags(parsed),
+        );
+        const missionId = option(parsed, "mission");
+        const itemId = option(parsed, "item");
+        const sessionId = option(parsed, "session");
+        if (missionId || itemId) {
+          if (!missionId || !itemId || !sessionId)
+            throw new Error(
+              "linked record requires --mission, --item, and --session",
+            );
+          const link = await new MissionRecordService(root).record({
+            missionId,
+            itemId,
+            sessionId,
+            idempotencyKey: required(parsed, "idempotency-key"),
+            classification: "semantic",
+            evidence: input,
+          });
+          io.stdout(`${JSON.stringify(link, null, 2)}\n`);
+          return 0;
+        }
+        if (sessionId && has(parsed, "idempotency-key"))
+          throw new Error("--session alone does not create a mission link");
         const receipt = await runMission(store.recordEvidence(input));
         io.stdout(`${JSON.stringify(receipt, null, 2)}\n`);
         return 0;
@@ -95,6 +129,155 @@ export async function runCli(
         const receipt = await runMission(store.getReceipt(eventId));
         if (!receipt) throw new Error(`unknown evidence receipt: ${eventId}`);
         io.stdout(`${JSON.stringify(receipt, null, 2)}\n`);
+        return 0;
+      }
+      case "plan": {
+        const action = parsed.positionals[0];
+        const missionId = option(parsed, "mission");
+        if (action === "show") {
+          if (!missionId) throw new Error("plan show requires --mission");
+          const generation = await plans.readCurrentGeneration(missionId);
+          const plan = generation
+            ? await plans.readPlanFromGeneration(generation)
+            : undefined;
+          if (!plan) throw new Error(`unknown mission plan: ${missionId}`);
+          io.stdout(`${JSON.stringify(plan, null, 2)}\n`);
+          return 0;
+        }
+        if (action === "create" || action === "update") {
+          if (!has(parsed, "stdin"))
+            throw new Error(`plan ${action} requires --stdin`);
+          const value = JSON.parse(await io.readStdin()) as unknown;
+          const idempotencyKey = required(parsed, "idempotency-key");
+          const plan =
+            action === "create"
+              ? await plans.createPlan(value, idempotencyKey)
+              : await plans.replacePlan(
+                  value,
+                  integerOption(parsed, "expected-revision"),
+                  idempotencyKey,
+                );
+          io.stdout(`${JSON.stringify(plan, null, 2)}\n`);
+          return 0;
+        }
+        throw new Error("plan requires create, update, or show");
+      }
+      case "session": {
+        if (parsed.positionals[0] !== "add" || !has(parsed, "stdin"))
+          throw new Error("session add requires --stdin");
+        const session = await plans.upsertSession(
+          JSON.parse(await io.readStdin()) as unknown,
+          has(parsed, "expected-revision")
+            ? integerOption(parsed, "expected-revision")
+            : null,
+          required(parsed, "idempotency-key"),
+        );
+        io.stdout(`${JSON.stringify(session, null, 2)}\n`);
+        return 0;
+      }
+      case "binding": {
+        const action = parsed.positionals[0];
+        const sessionId = required(parsed, "session");
+        if (action === "show") {
+          io.stdout(
+            `${JSON.stringify((await plans.getBinding(sessionId)) ?? null, null, 2)}\n`,
+          );
+          return 0;
+        }
+        if (action === "set" || action === "clear") {
+          const binding = await plans.setBinding({
+            sessionId,
+            ...(action === "set"
+              ? {
+                  missionId: required(parsed, "mission"),
+                  itemId: required(parsed, "item"),
+                }
+              : {}),
+            expectedRevision: integerOption(parsed, "expected-revision"),
+            idempotencyKey: required(parsed, "idempotency-key"),
+          });
+          io.stdout(`${JSON.stringify(binding, null, 2)}\n`);
+          return 0;
+        }
+        if (action === "fork") {
+          const binding = await plans.forkBinding(
+            required(parsed, "from"),
+            sessionId,
+            integerOption(parsed, "expected-revision"),
+            required(parsed, "idempotency-key"),
+          );
+          io.stdout(`${JSON.stringify(binding, null, 2)}\n`);
+          return 0;
+        }
+        throw new Error("binding requires show, set, clear, or fork");
+      }
+      case "link": {
+        const action = parsed.positionals[0];
+        if (!has(parsed, "stdin"))
+          throw new Error("link evidence|execution requires --stdin");
+        const value = JSON.parse(await io.readStdin()) as unknown;
+        const idempotencyKey = required(parsed, "idempotency-key");
+        if (action === "evidence") {
+          const link = await plans.linkEvidence(value, idempotencyKey);
+          io.stdout(`${JSON.stringify(link, null, 2)}\n`);
+          return 0;
+        }
+        if (action === "execution") {
+          const binding = await plans.bindExecution(value, idempotencyKey);
+          io.stdout(`${JSON.stringify(binding, null, 2)}\n`);
+          return 0;
+        }
+        throw new Error("link requires evidence or execution");
+      }
+      case "migrate": {
+        if (parsed.positionals[0] !== "index" || !has(parsed, "stdin"))
+          throw new Error("migrate index requires --stdin");
+        const value = JSON.parse(await io.readStdin()) as unknown;
+        if (!isLegacyImportMapping(value))
+          throw new Error("invalid migrate index mapping");
+        const result = await new MissionMigrations(root).index(value);
+        io.stdout(`${JSON.stringify(result, null, 2)}\n`);
+        return 0;
+      }
+      case "artifact": {
+        if (parsed.positionals[0] !== "verify")
+          throw new Error("artifact requires verify");
+        const artifactId = parsed.positionals[1];
+        if (!artifactId)
+          throw new Error("artifact verify requires an artifact ID");
+        const router = new ArtifactRouter(root);
+        const resolved = await router.resolve(artifactId);
+        if (resolved.status !== "available")
+          throw new Error(`artifact ${resolved.status}: ${resolved.reason}`);
+        try {
+          const descriptor = {
+            artifactId: resolved.value.artifactId,
+            receiptEventId: resolved.value.receiptEventId,
+            mediaType: resolved.value.mediaType,
+            role: resolved.value.role,
+            size: resolved.value.size,
+            sha256: resolved.value.sha256,
+          };
+          io.stdout(
+            `${JSON.stringify({ status: "available", descriptor }, null, 2)}\n`,
+          );
+        } finally {
+          router.close(resolved.value);
+        }
+        return 0;
+      }
+      case "mission": {
+        if (parsed.positionals[0] !== "show")
+          throw new Error("mission requires show");
+        const missionId = required(parsed, "mission");
+        const projection = buildMissionProjection(
+          await new MissionIndex(root).snapshot(missionId),
+        );
+        io.stdout(
+          has(parsed, "plain")
+            ? projectionToPlain(projection)
+            : `${JSON.stringify(projection, null, 2)}\n`,
+        );
         return 0;
       }
       default:
@@ -259,6 +442,27 @@ function has(parsed: ParsedArguments, key: string): boolean {
   return parsed.options.has(key);
 }
 
+function integerOption(parsed: ParsedArguments, key: string): number {
+  const value = Number(required(parsed, key));
+  if (!Number.isSafeInteger(value) || value < 0)
+    throw new Error(`--${key} must be a non-negative integer`);
+  return value;
+}
+
+function isLegacyImportMapping(
+  value: unknown,
+): value is import("./mission-migrations.ts").LegacyImportMapping {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.sourceMissionId === "string" &&
+    typeof record.contextToken === "string" &&
+    typeof record.targetMissionId === "string" &&
+    typeof record.idempotencyKey === "string"
+  );
+}
+
 function isJsonObject(
   value: unknown,
 ): value is Record<string, import("./types.ts").JsonValue> {
@@ -275,7 +479,15 @@ function defined<Key extends string, Value>(
 }
 
 function usage(): string {
-  return `missionctl — durable mission evidence\n\nUsage:\n  missionctl context-create --mission ID --title TITLE [--cwd PATH]\n  missionctl context-status TOKEN --status completed|failed|cancelled\n  missionctl record --context TOKEN --title TITLE [--artifact role=PATH]\n  missionctl record --stdin [--context TOKEN]\n  missionctl list [--context TOKEN]\n  missionctl contexts\n  missionctl show EVENT_ID\n\nEnvironment:\n  MISSION_CONTROL_HOME   Override the durable store root\n  PI_EXECUTION_CONTEXT   Default context token for record\n`;
+  return `missionctl — durable mission evidence\n\nUsage:\n  missionctl context-create --mission ID --title TITLE [--cwd PATH]\n  missionctl context-status TOKEN --status completed|failed|cancelled\n  missionctl record --context TOKEN --title TITLE [--artifact role=PATH]\n  missionctl record --context TOKEN --mission ID --item ID --session ID --idempotency-key KEY --title TITLE\n  missionctl record --stdin [--context TOKEN]\n  missionctl list [--context TOKEN]\n  missionctl contexts\n  missionctl show EVENT_ID
+  missionctl plan create|update --stdin --idempotency-key KEY
+  missionctl plan show --mission ID
+  missionctl session add --stdin --idempotency-key KEY
+  missionctl binding show|set|clear|fork --session ID ...
+  missionctl link evidence|execution --stdin --idempotency-key KEY
+  missionctl migrate index --stdin
+  missionctl mission show --mission ID [--plain|--json]
+  missionctl artifact verify ARTIFACT_ID\n\nEnvironment:\n  MISSION_CONTROL_HOME   Override the durable store root\n  PI_EXECUTION_CONTEXT   Default context token for record\n`;
 }
 
 const defaultIo = {
