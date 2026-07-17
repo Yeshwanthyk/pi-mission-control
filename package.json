@@ -1,0 +1,44 @@
+{
+  "name": "pi-mission-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "keywords": [
+    "pi-package"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "missionctl": "./bin/missionctl.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "format": "prettier --write \"{bin,extensions,src,test}/**/*.ts\" \"*.{json,md}\"",
+    "format:check": "prettier --check \"{bin,extensions,src,test}/**/*.ts\" \"*.{json,md}\""
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/mission-control/index.ts"
+    ]
+  },
+  "dependencies": {
+    "effect": "4.0.0-beta.98",
+    "glimpseui": "^0.8.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.80.7",
+    "@earendil-works/pi-coding-agent": "^0.80.7",
+    "@types/node": "^24.0.0",
+    "prettier": "^3.6.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0"
+  }
+}
